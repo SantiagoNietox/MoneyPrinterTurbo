@@ -21,6 +21,7 @@ from PIL import Image, UnidentifiedImageError
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import (
+    contextual_provider,
     material_cache,
     material_upload,
     metaso_minimax,
@@ -1823,6 +1824,260 @@ def _download_videos_openai_image_on_demand(
     return video_paths
 
 
+def _download_videos_contextual_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+    progress_callback: Callable[[float], None] | None = None,
+) -> List[str]:
+    """
+    Descarga imágenes reales de archivo y prensa basadas en términos contextuales
+    y las transforma en clips de video usando el motor cinematográfico Ken Burns.
+    Cubre la duración total requerida por el audio narrado.
+    """
+    if not material_directory:
+        material_directory = utils.task_dir(task_id)
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+
+    try:
+        required_duration = float(audio_duration)
+    except (TypeError, ValueError):
+        required_duration = 0.0
+
+    if required_duration <= 0:
+        logger.warning(
+            "skip contextual media generation because required audio duration is not positive"
+        )
+        _persist_material_sources(task_id, material_sources)
+        return video_paths
+
+    provider = contextual_provider.ContextualMediaProvider()
+    
+    video_subject = ""
+    video_script = ""
+    task_script_file = os.path.join(utils.task_dir(task_id), "script.json")
+    if os.path.isfile(task_script_file):
+        try:
+            with open(task_script_file, "r", encoding="utf-8") as f:
+                s_data = json.load(f)
+                video_script = s_data.get("script", "")
+                params_obj = s_data.get("params", {})
+                video_subject = params_obj.get("video_subject", "")
+        except Exception:
+            pass
+
+    needed_clips = max(1, int(math.ceil(required_duration / max(1, max_clip_duration))))
+    # Asegurar al menos 2 imágenes por término para tener variedad en el pool
+    per_term_target = max(2, int(math.ceil((needed_clips + 2) / max(1, len(search_terms)))))
+    
+    effects_sequence = [
+        "zoom_in", "pan_lr", "zoom_out", "pan_rl", "tilt_down", "tilt_up", "zoom_in_pan"
+    ]
+    clip_counter = 0
+
+    # 1. Recolectar candidatos de TODOS los términos (para que ningún término quede fuera)
+    term_pools: List[List[MaterialInfo]] = []
+    seen_urls = set()
+
+    for search_term in search_terms:
+        try:
+            items = provider.search_images(
+                search_term=search_term,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+                max_results=per_term_target,
+            )
+            valid_items = []
+            for item in items:
+                if item.url and item.url not in seen_urls:
+                    seen_urls.add(item.url)
+                    valid_items.append(item)
+            if valid_items:
+                term_pools.append(valid_items)
+        except Exception as exc:
+            logger.warning(f"[Contextual] Failed searching for {search_term!r}: {exc}")
+            continue
+
+    # 2. Si faltan candidatos para cubrir los clips necesarios, buscar variantes adicionales del tema base
+    total_found = sum(len(pool) for pool in term_pools)
+    if total_found < needed_clips and search_terms:
+        base_term = search_terms[0]
+        extra_queries = [
+            f"{base_term} behind the scenes",
+            f"{base_term} production still",
+            f"{base_term} on set vintage",
+            f"{base_term} archival photo",
+        ]
+        for extra_q in extra_queries:
+            if sum(len(pool) for pool in term_pools) >= needed_clips + 3:
+                break
+            try:
+                extra_items = provider.search_images(
+                    search_term=extra_q,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                    save_dir=material_directory,
+                    max_results=3,
+                )
+                valid_extra = []
+                for item in extra_items:
+                    if item.url and item.url not in seen_urls:
+                        seen_urls.add(item.url)
+                        valid_extra.append(item)
+                if valid_extra:
+                    term_pools.append(valid_extra)
+            except Exception:
+                continue
+
+    # 3. Intercalar en Round-Robin (Término 1 -> Término 2 -> Término 3 -> ...)
+    # Esto garantiza que cada corte de 3 segundos muestre una faceta visual distinta
+    interleaved_items: List[MaterialInfo] = []
+    max_pool_depth = max((len(pool) for pool in term_pools), default=0)
+    for depth in range(max_pool_depth):
+        for pool in term_pools:
+            if depth < len(pool):
+                interleaved_items.append(pool[depth])
+
+    logger.info(
+        f"[Contextual] Interleaved {len(interleaved_items)} unique archival images across {len(term_pools)} terms for {needed_clips} needed clips"
+    )
+
+    # 4. Descargar fragmentos de vídeo real (escenas clave de la película y tráiler)
+    trailer_clips = []
+    target_video_clips = max(8, int(math.ceil(needed_clips * 0.6)))
+    if search_terms or video_subject:
+        try:
+            trailer_clips = provider.fetch_trailer_clips(
+                query=search_terms[0] if search_terms else video_subject,
+                num_clips=target_video_clips,
+                clip_duration=max_clip_duration,
+                video_aspect=video_aspect,
+                save_dir=material_directory,
+                video_subject=video_subject,
+                video_script=video_script,
+            )
+            if trailer_clips:
+                logger.success(
+                    f"[Contextual] Obtained {len(trailer_clips)} real movie scene clips (target was {target_video_clips})"
+                )
+        except Exception as trailer_err:
+            logger.warning(
+                f"[Contextual] Could not fetch trailer clips, falling back to 100% archival photos: {trailer_err}"
+            )
+
+    # 5. Intercalar metraje real de vídeo con fotografías de archivo (Ken Burns)
+    # Patrón: 1 Vídeo Real -> 1 Foto Archivo -> 1 Vídeo Real -> 1 Foto Archivo...
+    # (Garantiza mínimo 50% de metraje de vídeo real en movimiento en todo el Reel)
+    trailer_index = 0
+    photo_index = 0
+
+    while total_duration < required_duration and (
+        photo_index < len(interleaved_items) or trailer_index < len(trailer_clips)
+    ):
+        # Turnos alternados: Par = VÍDEO REAL, Impar = FOTO KEN BURNS
+        want_video = (len(video_paths) % 2 == 0)
+
+        if want_video and trailer_index < len(trailer_clips):
+            t_item = trailer_clips[trailer_index]
+            trailer_index += 1
+            video_paths.append(t_item.url)
+            material_sources.append(_material_source_record(t_item, t_item.url))
+            total_duration += max_clip_duration
+            logger.info(
+                f"[Contextual] Appended real video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+            )
+            if progress_callback and required_duration > 0:
+                try:
+                    progress_callback(min(1.0, total_duration / required_duration))
+                except Exception:
+                    pass
+            continue
+
+        if photo_index < len(interleaved_items):
+            item = interleaved_items[photo_index]
+            photo_index += 1
+            try:
+                chosen_effect = effects_sequence[clip_counter % len(effects_sequence)]
+                clip_counter += 1
+                video_file = video.render_image_ken_burns_video(
+                    image_path=item.url,
+                    clip_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                    effect=chosen_effect,
+                )
+                if not video_file:
+                    continue
+                video_paths.append(video_file)
+                material_sources.append(_material_source_record(item, video_file))
+                total_duration += max_clip_duration
+
+                if progress_callback and required_duration > 0:
+                    try:
+                        progress_callback(min(1.0, total_duration / required_duration))
+                    except Exception:
+                        pass
+                continue
+            except Exception as render_err:
+                logger.warning(
+                    f"[Contextual] Ken Burns render failed for {item.url}: {render_err}"
+                )
+                continue
+
+        if trailer_index < len(trailer_clips):
+            t_item = trailer_clips[trailer_index]
+            trailer_index += 1
+            video_paths.append(t_item.url)
+            material_sources.append(_material_source_record(t_item, t_item.url))
+            total_duration += max_clip_duration
+            logger.info(
+                f"[Contextual] Appended extra video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+            )
+            if progress_callback and required_duration > 0:
+                try:
+                    progress_callback(min(1.0, total_duration / required_duration))
+                except Exception:
+                    pass
+            continue
+
+    # Último recurso solo si no hubo suficientes imágenes en absoluto
+    if total_duration < required_duration and interleaved_items:
+        logger.info("[Contextual] Alternating remaining camera movements to cover full audio")
+        cycle_idx = 0
+        while total_duration < required_duration and cycle_idx < len(interleaved_items) * 4:
+            item = interleaved_items[cycle_idx % len(interleaved_items)]
+            chosen_effect = effects_sequence[(clip_counter + cycle_idx) % len(effects_sequence)]
+            cycle_idx += 1
+            try:
+                video_file = video.render_image_ken_burns_video(
+                    image_path=item.url,
+                    clip_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                    effect=chosen_effect,
+                )
+                if video_file:
+                    video_paths.append(video_file)
+                    total_duration += max_clip_duration
+                    if progress_callback and required_duration > 0:
+                        try:
+                            progress_callback(min(1.0, total_duration / required_duration))
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+    logger.success(f"[Contextual] Successfully produced {len(video_paths)} unique Ken Burns archival clips ({total_duration:.1f}s)")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
 def _search_videos_with_cache(
     provider: str,
     search_videos: Callable[..., List[MaterialInfo]],
@@ -2247,6 +2502,16 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+        )
+    if source == "contextual":
+        return _download_videos_contextual_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+            progress_callback=progress_callback,
         )
 
     if match_script_order:

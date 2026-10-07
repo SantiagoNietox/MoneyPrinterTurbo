@@ -126,6 +126,7 @@ LOOMLOOM_MAX_POLL_FAILURES = 5
 # 胜算云、火山引擎排列；其余服务随后展示。这样两个入口的顺序一致，同时
 # 不改变 config.toml、历史任务和 API 请求中的字段语义，旧用户无需迁移配置。
 VIDEO_SOURCE_GROUPS = {
+    "contextual": ("contextual",),
     "stock_video": ("pexels", "pixabay", "coverr"),
     "ai_video": (
         "metaso_minimax",
@@ -191,15 +192,15 @@ LOOMLOOM_VIDEO_MODEL_PRICES = (
 )
 DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_enabled": True,
-    "font_name": "MicrosoftYaHeiBold.ttc",
-    "subtitle_position": "bottom",
-    "subtitle_display_mode": "sentence",
-    "subtitle_animation": "none",
+    "font_name": "BeVietnamPro-Bold.ttf",
+    "subtitle_position": "two_thirds_bottom",
+    "subtitle_display_mode": "word_by_word",
+    "subtitle_animation": "pop_spring",
     "custom_position": 70.0,
     "text_fore_color": "#FFFFFF",
-    "font_size": 60,
+    "font_size": 52,
     "stroke_color": "#000000",
-    "stroke_width": 1.5,
+    "stroke_width": 2.0,
     "subtitle_background_enabled": False,
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
@@ -4640,12 +4641,14 @@ def _render_local_script_generation(params):
                 custom_system_prompt=params.custom_system_prompt,
                 app_config=app_config_snapshot,
             )
+            is_contextual = getattr(params, "video_source", "") == "contextual"
             terms = llm.generate_terms(
                 params.video_subject,
                 script,
-                amount=8 if params.match_materials_to_script else 5,
-                match_script_order=params.match_materials_to_script,
+                amount=10 if is_contextual else (8 if params.match_materials_to_script else 5),
+                match_script_order=True if is_contextual else params.match_materials_to_script,
                 app_config=app_config_snapshot,
+                video_source=getattr(params, "video_source", ""),
             )
             return script, terms
 
@@ -5141,14 +5144,16 @@ def _render_script_settings(panel, params):
                     st.warning(tr("Please Enter the Video Subject"))
                 else:
                     with st.spinner(tr("Generating Video Keywords")):
+                        is_contextual = getattr(params, "video_source", "") == "contextual"
                         terms = _run_llm_read_operation(
                             "generate_terms",
                             lambda app_config_snapshot: llm.generate_terms(
                                 params.video_subject,
                                 params.video_script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
+                                amount=10 if is_contextual else (8 if params.match_materials_to_script else 5),
+                                match_script_order=True if is_contextual else params.match_materials_to_script,
                                 app_config=app_config_snapshot,
+                                video_source=getattr(params, "video_source", ""),
                             ),
                         )
                         if "Error: " in terms:
@@ -5174,6 +5179,7 @@ def _render_video_settings(panel, params):
                 (tr("Random"), "random"),
             ]
             video_source_labels = {
+                "contextual": tr("Contextual Archival Media ('La Otra Pantalla')"),
                 "pexels": tr("Pexels"),
                 "pixabay": tr("Pixabay"),
                 "coverr": tr("Coverr"),
@@ -5192,6 +5198,7 @@ def _render_video_settings(panel, params):
             params.video_source = grouped_selectbox(
                 tr("Video Source"),
                 groups=(
+                    (tr("Contextual Archival Media"), VIDEO_SOURCE_GROUPS["contextual"]),
                     (tr("Stock Video"), VIDEO_SOURCE_GROUPS["stock_video"]),
                     (tr("AI Video"), VIDEO_SOURCE_GROUPS["ai_video"]),
                     (tr("AI Image"), VIDEO_SOURCE_GROUPS["ai_image"]),
@@ -8011,6 +8018,7 @@ def _render_generation_controls(
             voxcpm_prompt_text = _get_voxcpm_prompt_text()
 
         if params.video_source not in [
+            "contextual",
             "pexels",
             "pixabay",
             "coverr",

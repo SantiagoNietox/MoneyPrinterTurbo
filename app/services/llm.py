@@ -33,20 +33,34 @@ _SENSITIVE_QUERY_RE = re.compile(
 )
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
-# Role: Video Script Generator
+# Role: Video Script Generator (Cinema Mystery & High-Retention Documentary - "La Otra Pantalla")
 
-## Goals:
-Generate a script for a video, depending on the subject of the video.
+## Objective:
+Generate a gripping, high-retention micro-documentary script for short-form video (Facebook/Instagram Reels, TikTok, YouTube Shorts) based on the requested movie topic, dark filming secret, or mystery.
 
-## Constrains:
-1. the script is to be returned as a string with the specified number of paragraphs.
-2. do not under any circumstance reference this prompt in your response.
-3. get straight to the point, don't start with unnecessary things like, "welcome to this video".
-4. you must not include any type of markdown or formatting in the script, never use a title.
-5. only return the raw content of the script.
-6. do not include "voiceover", "narrator" or similar indicators of what should be spoken at the beginning of each paragraph or line.
-7. you must not mention the prompt, or anything about the script itself. also, never talk about the amount of paragraphs or lines. just write the script.
-8. respond in the same language as the video subject.
+## Narrative Structure (High-Retention Viral Pacing):
+1. **THE 3-SECOND HOOK (Zero Fluff):**
+   - Start INSTANTLY with an arresting revelation, an unsettling fact, an on-set secret, or a paradoxical question.
+   - STRICTLY FORBIDDEN: NEVER start with greetings, "Bienvenido", "Hoy te voy a contar", "En este video", or dry encyclopedic dates. The first sentence must trigger immediate curiosity and stop the scroll.
+2. **ESCALATING TENSION & DIRECT VIEWER INVOLVEMENT (ArchivoXtraño Style):**
+   - Directly draw the viewer into the story with visceral, immersive framing (e.g., "Imagina estar atrapado...", "Lo que estás viendo en pantalla no fue actuación, fue terror real...", "Cada segundo que miras esta escena...").
+   - Explore the hidden side of the production: the director's intense perfectionism, the actor's extreme physical or mental sacrifice, unscripted accidents, or disturbing set occurrences.
+   - Write with punchy, suspenseful sentences that give dramatic weight to voiceover narration.
+3. **ICONIC SCENE & FILMING DETAILS:**
+   - Vividly name and describe the defining scene or filming moment (e.g., "la escena del hospital", "el interrogatorio", "la puerta del hacha", "el rodaje en el hotel"). Mentioning concrete scenes anchors the viewer's mental image and aligns directly with archival footage.
+4. **MAGNETIC CLIMAX & COMMENT-DRIVING ENDING:**
+   - Conclude with a thought-provoking twist or an open question that compels viewers to debate in the comments (e.g., "¿Genialidad actoral o locura destructiva?", "¿Hasta dónde debería llegar un director por una toma perfecta?"). High comment volume drives the social media algorithm.
+
+## Tone & Rhythm:
+- Tone: Enigmatic, dark, captivating, dramatic, and respectful of cinema history.
+- Rhythm: Natural pauses, varied sentence lengths, crafted specifically for a deep, resonant voiceover (like ElevenLabs captivating storytelling style).
+- Language: Neutral Spanish with rich narrative flavor (or match the requested language of the video subject).
+
+## Strict Output Constraints:
+1. Return ONLY the raw spoken words to be narrated.
+2. NEVER include scene directions, markdown formatting, asterisks, brackets, quotes, or headers (NO "[Pausa]", NO "(Música dramática)", NO "Narrador:", NO "# Título").
+3. DO NOT mention this prompt, word counts, or structural instructions.
+4. Organize the script cleanly into the specified number of paragraphs.
 """.strip()
 
 # Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
@@ -852,15 +866,69 @@ def _strip_code_fence(text: str) -> str:
     return t.strip()
 
 
+CONTEXTUAL_TERMS_SYSTEM_PROMPT = """
+# Role: Cinema & Archival Media Search Expert (Named Entity Recognition)
+
+## Goals:
+Extract {amount} chronological, highly specific image search terms in English from the video script for the channel "La Otra Pantalla".
+These queries will be used to search photo archives, press photos, production stills, and behind-the-scenes material.
+
+## STRICT RULES:
+1. FORBIDDEN ABSTRACT TERMS: NEVER use generic or conceptual terms (e.g. "sad actor", "danger", "director working", "camera", "film set", "dark room", "actor talking", "action scene").
+2. REQUIRED NAMED ENTITIES (NER): You MUST identify real entities:
+   - Full names of actors, actresses, directors, producers, or crew members.
+   - Exact movie or TV show titles (ALWAYS include the release year, e.g. "The Shining 1980", "The Grinch 2000").
+   - Real filming locations, studios, agencies, or real organizations (e.g. "Elstree Studios", "Timberline Lodge Oregon", "Universal Studios backlot").
+3. DOCUMENTARY SUFFIXES: Every search query MUST end with or include a concrete archival/production modifier such as:
+   - "behind the scenes"
+   - "vintage press photo"
+   - "production still"
+   - "archival document"
+   - "on set photo"
+   - "raw footage frame"
+   - "original storyboard"
+   - "rare archival photo"
+4. FORMAT: Return ONLY a valid JSON array of strings: ["term 1", "term 2", ...]. English only. Do NOT output markdown ticks or conversational text.
+5. CHRONOLOGY: The terms must strictly match the chronological progression of the script narration.
+
+## Output Example:
+[
+  "Stanley Kubrick Shining 1980 set behind the scenes",
+  "Jack Nicholson Overlook Hotel production still 1980",
+  "Garrett Brown Steadicam The Shining 1980 vintage photo",
+  "Stanley Kubrick original typed script archival document",
+  "Shelley Duvall Shining 1980 vintage press photo"
+]
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+
+Please note that you must use English for generating video search terms.
+""".strip()
+
+
 def generate_terms(
     video_subject: str,
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
     app_config=None,
+    video_source: str = "",
 ) -> List[str]:
     video_script = utils.remove_pause_tags(video_script or "").strip()
-    if match_script_order:
+    is_contextual = video_source == "contextual"
+
+    if is_contextual:
+        prompt = CONTEXTUAL_TERMS_SYSTEM_PROMPT.format(
+            amount=amount,
+            video_subject=video_subject,
+            video_script=video_script,
+        )
+    elif match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
             "the order of topics in the video script."
@@ -877,6 +945,32 @@ def generate_terms(
             "final visual topic",
         ]
         output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
+        prompt = f"""
+# Role: Video Search Terms Generator
+
+## Goals:
+{goal}
+
+## Constrains:
+1. the search terms are to be returned as a json-array of strings.
+2. each search term should consist of 1-3 words, always add the main subject of the video.
+3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
+4. the search terms must be related to the subject of the video.
+5. reply with english search terms only.
+{ordering_rule}
+
+## Output Example:
+{output_example}
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+
+Please note that you must use English for generating video search terms; Chinese is not accepted.
+""".strip()
     else:
         goal = (
             f"Generate {amount} search terms for stock videos, depending on the "
@@ -887,8 +981,7 @@ def generate_terms(
             '["search term 1", "search term 2", "search term 3",'
             '"search term 4", "search term 5"]'
         )
-
-    prompt = f"""
+        prompt = f"""
 # Role: Video Search Terms Generator
 
 ## Goals:
@@ -915,7 +1008,9 @@ def generate_terms(
 Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
-    logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
+    logger.info(
+        f"subject: {video_subject}, match_script_order: {match_script_order}, contextual: {is_contextual}"
+    )
 
     search_terms = []
     response = ""
@@ -966,6 +1061,25 @@ Please note that you must use English for generating video search terms; Chinese
 
     logger.success(f"completed: \n{search_terms}")
     return search_terms
+
+
+def generate_contextual_terms(
+    video_subject: str,
+    video_script: str,
+    amount: int = 5,
+    app_config=None,
+) -> List[str]:
+    """
+    专门为“La Otra Pantalla”提取具象的影视与历史档案搜索词（NER + 纪录片后缀）。
+    """
+    return generate_terms(
+        video_subject=video_subject,
+        video_script=video_script,
+        amount=amount,
+        match_script_order=True,
+        app_config=app_config,
+        video_source="contextual",
+    )
 
 
 # =============================================================================

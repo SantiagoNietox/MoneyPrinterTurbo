@@ -5,6 +5,7 @@ import io
 import math
 import os
 import random
+import re
 import gc
 import subprocess
 import sys
@@ -202,6 +203,32 @@ def _apply_subtitle_spring_animation(clip, subtitle_duration: float):
     # apply_to=["mask"] 是修复的关键：MoviePy 默认只处理颜色帧，旧实现因此
     # 在每条字幕出现时短暂保留原尺寸蒙版，并显示黑色文字轮廓。
     return clip.transform(transform_frame, apply_to=["mask"])
+
+
+_IMPACT_KEYWORDS = {
+    "muerte", "sangre", "fractura", "accidente", "trauma", "tormento", "brutal",
+    "supervivencia", "hipotermia", "peligro", "secreto", "real", "maldición",
+    "maldicion", "infierno", "pesadilla", "locura", "explosión", "explosion",
+    "bomba", "dinamita", "fuego", "terror", "miedo", "shock", "hospital",
+    "joker", "batman", "oppenheimer", "nolan", "kubrick", "dicaprio", "blair",
+    "cadáver", "cadaver", "asesinato", "congelamiento", "grave", "dolor",
+    "víctima", "victima", "tragedia", "fatal", "mortal", "mutilad", "trinity",
+    "siniestro", "oscuro", "terrorífico", "terrorifico", "cero", "desnudo"
+}
+
+
+def _is_high_impact_subtitle_phrase(phrase: str) -> bool:
+    """Detecta si una palabra o frase corta merece resaltado de color cinemático."""
+    if not phrase:
+        return False
+    # Números y fechas (ej. 1980, 2023, 10, 30, etc.)
+    if re.search(r"\b\d+\b", phrase):
+        return True
+    words = re.findall(r"[a-zA-ZáéíóúñÁÉÍÓÚÑ]+", phrase.lower())
+    for w in words:
+        if w in _IMPACT_KEYWORDS:
+            return True
+    return False
 
 
 def _get_required_video_duration(audio_duration: float) -> float:
@@ -1130,8 +1157,18 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
+            # Organic human pacing: Hook is punchy (2.0s-2.2s), alternating rhythms for b-roll
+            if index == 0:
+                clip_target_dur = max(1.8, min(max_clip_duration, 2.2))
+            elif index % 3 == 1:
+                clip_target_dur = min(max_clip_duration + 0.4, 3.4)
+            elif index % 3 == 2:
+                clip_target_dur = max(2.0, max_clip_duration - 0.3)
+            else:
+                clip_target_dur = max_clip_duration
+
+            if clip.duration > clip_target_dur:
+                clip = clip.subclipped(0, clip_target_dur)
 
             # Write each candidate clip to a unique temporary file. Threads must not
             # share the same output path.
@@ -1586,6 +1623,7 @@ def generate_video(
         params.stroke_width = int(params.stroke_width)
         phrase = subtitle_item[1]
         max_width = video_width * 0.9
+
         bg_color = resolve_subtitle_background_color()
         rounded_bg_enabled = bool(
             getattr(params, "rounded_subtitle_background", False) and bg_color
@@ -1734,8 +1772,8 @@ def generate_video(
         elif params.subtitle_position == "top":
             _clip = _clip.with_position(("center", video_height * 0.05))
         elif params.subtitle_position in ("two_thirds_bottom", "two_thirds", "2/3_bottom"):
-            # 2/3 from the bottom = 1/3 from the top: y = (video_height - _clip.h) * (1/3)
-            y_two_thirds = (video_height - _clip.h) / 3.0
+            # Lower-third position for vertical reels/shorts: y ≈ 75% down
+            y_two_thirds = (video_height - _clip.h) * 0.75
             _clip = _clip.with_position(("center", y_two_thirds))
         elif params.subtitle_position == "custom":
             # Ensure the subtitle is fully within the screen bounds
@@ -1854,58 +1892,152 @@ def generate_video(
         return bgm_mix_succeeded
 
 
-def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
+def render_image_ken_burns_video(
+    image_path: str,
+    clip_duration: int = 5,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    effect: str = "auto",
+) -> str:
     """
-    将单张本地图片渲染为带缓慢放大效果的 mp4 片段，返回输出文件路径。
+    Motor cinemático Ken Burns para 'La Otra Pantalla'.
+    Convierte una imagen estática en un clip mp4 dinámico (1080x1920 u otro aspect ratio)
+    con movimientos fluidos de cámara (Zoom In, Zoom Out, Pan horizontal, Tilt vertical).
+    Utiliza aceleración directa por FFmpeg para máxima nitidez y rendimiento (<1.5s),
+    con fallback robusto a MoviePy.
+    """
+    try:
+        aspect = VideoAspect(video_aspect)
+    except Exception:
+        aspect = VideoAspect.portrait
+    target_width, target_height = aspect.to_resolution()
 
-    local 素材预处理和 OpenAI 兼容文生图素材共用这段"图片 → 片段"渲染
-    逻辑：ImageClip 按 clip_duration 固定时长播放，并叠加每秒约 3% 的
-    动态放大，避免静态画面在成片中显得呆板。渲染异常由调用方按各自
-    素材源的失败约定处理。
-    """
-    clip, _ = _open_image_clip_with_fallback(image_path)
-    clip = clip.with_duration(clip_duration).with_position("center")
+    available_effects = [
+        "zoom_in",
+        "zoom_out",
+        "pan_lr",
+        "pan_rl",
+        "tilt_down",
+        "tilt_up",
+        "zoom_in_pan",
+    ]
+    if effect not in available_effects:
+        effect = random.choice(available_effects)
+
+    source_identity = hashlib.sha256(os.fsencode(os.path.abspath(image_path))).hexdigest()
+    cache_meta = f"{clip_duration}_{aspect.value}_{effect}"
+    meta_identity = hashlib.sha256(cache_meta.encode()).hexdigest()[:12]
+    video_file = os.path.join(
+        os.path.dirname(image_path), f"{source_identity}.kb-{meta_identity}.mp4"
+    )
+
+    if os.path.isfile(video_file) and os.path.getsize(video_file) > 1024:
+        return video_file
+
+    ffmpeg_bin = get_ffmpeg_binary()
     temp_path = ""
     try:
-        # Apply a zoom effect using the resize method.
-        # A lambda function is used to make the zoom effect dynamic over time.
-        # The zoom effect starts from the original size and gradually scales up to 120%.
-        # t represents the current time, and clip.duration is the total duration of the clip.
-        # Note: 1 represents 100% size, so 1.2 represents 120%.
+        descriptor, temp_path = tempfile.mkstemp(
+            prefix=".kb-",
+            suffix=".mp4",
+            dir=os.path.dirname(os.path.abspath(video_file)),
+        )
+        os.close(descriptor)
+
+        total_frames = max(1, int(clip_duration * fps))
+        scale_w = int(target_width * 1.30)
+        scale_h = int(target_height * 1.30)
+        zoom_step = round((1.35 - 1.05) / total_frames, 5)
+
+        effect_filter_map = {
+            "zoom_in": f"zoompan=z='min(zoom+{zoom_step},1.35)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "zoom_out": f"zoompan=z='if(lte(on,1),1.35,max(1.05,zoom-{zoom_step}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "pan_lr": f"zoompan=z='1.25':x='(on/{total_frames})*(iw-iw/zoom)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "pan_rl": f"zoompan=z='1.25':x='(1-(on/{total_frames}))*(iw-iw/zoom)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "tilt_down": f"zoompan=z='1.25':x='iw/2-(iw/zoom/2)':y='(on/{total_frames})*(ih-ih/zoom)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "tilt_up": f"zoompan=z='1.25':x='iw/2-(iw/zoom/2)':y='(1-(on/{total_frames}))*(ih-ih/zoom)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+            "zoom_in_pan": f"zoompan=z='min(zoom+{zoom_step},1.30)':x='(on/{total_frames})*(iw-iw/zoom)':y='ih/2-(ih/zoom/2)':d={total_frames}:s={target_width}x{target_height}:fps={fps}",
+        }
+        zoom_filter = effect_filter_map.get(effect, effect_filter_map["zoom_in"])
+
+        vf_chain = (
+            f"scale={scale_w}:{scale_h}:force_original_aspect_ratio=increase,"
+            f"crop={scale_w}:{scale_h},"
+            f"{zoom_filter},"
+            f"{_BT709_VIDEO_FILTER},"
+            f"format=yuv420p"
+        )
+
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-loop", "1",
+            "-i", os.path.abspath(image_path),
+            "-vf", vf_chain,
+            "-t", str(clip_duration),
+            "-c:v", _DEFAULT_VIDEO_CODEC,
+            "-pix_fmt", "yuv420p",
+            temp_path,
+        ]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode == 0 and os.path.isfile(temp_path) and os.path.getsize(temp_path) > 1024:
+            os.replace(temp_path, video_file)
+            temp_path = ""
+            return video_file
+        else:
+            logger.warning(
+                f"FFmpeg Ken Burns failed (code {proc.returncode}), falling back to MoviePy: {proc.stderr.decode('utf-8', errors='ignore')[-200:]}"
+            )
+    except Exception as exc:
+        logger.warning(f"FFmpeg Ken Burns execution error, falling back to MoviePy: {exc}")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            delete_files(temp_path)
+
+    # Fallback MoviePy
+    clip, _ = _open_image_clip_with_fallback(image_path)
+    clip = clip.with_duration(clip_duration).with_position("center")
+    fallback_temp = ""
+    try:
         zoom_clip = clip.resized(
             lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
         )
-
-        # Optionally, create a composite video clip containing the zoomed clip.
-        # This is useful if you want to add other elements to the video.
-        final_clip = CompositeVideoClip([zoom_clip])
-        try:
-            # The duration changes the rendered content, so it must be part of
-            # the output identity. Different tasks may render the same image
-            # concurrently; only publish a complete MP4 after MoviePy closes it.
-            source_identity = hashlib.sha256(os.fsencode(os.path.abspath(image_path))).hexdigest()
-            duration_identity = hashlib.sha256(str(clip_duration).encode()).hexdigest()[:16]
-            video_file = os.path.join(
-                os.path.dirname(image_path), f"{source_identity}.zoom-{duration_identity}.mp4"
-            )
-            descriptor, temp_path = tempfile.mkstemp(
-                prefix=".image-zoom-",
-                suffix=".mp4",
-                dir=os.path.dirname(os.path.abspath(video_file)),
-            )
-            os.close(descriptor)
-            final_clip.write_videofile(
-                temp_path, fps=30, logger=None, ffmpeg_params=_BT709_FFMPEG_PARAMS
-            )
-        finally:
-            close_clip(final_clip)
-        os.replace(temp_path, video_file)
-        temp_path = ""
+        fitted_clip = _fit_clip_to_canvas(
+            zoom_clip,
+            target_width=target_width,
+            target_height=target_height,
+            fit_mode=VideoFitMode.cover,
+        )
+        descriptor, fallback_temp = tempfile.mkstemp(
+            prefix=".image-kb-fallback-",
+            suffix=".mp4",
+            dir=os.path.dirname(os.path.abspath(video_file)),
+        )
+        os.close(descriptor)
+        fitted_clip.write_videofile(
+            fallback_temp, fps=fps, logger=None, ffmpeg_params=_BT709_FFMPEG_PARAMS
+        )
+        close_clip(fitted_clip)
+        os.replace(fallback_temp, video_file)
+        fallback_temp = ""
         return video_file
     finally:
         close_clip(clip)
-        if temp_path:
-            delete_files(temp_path)
+        if fallback_temp and os.path.exists(fallback_temp):
+            delete_files(fallback_temp)
+
+
+def render_image_zoom_video(image_path: str, clip_duration: int = 5) -> str:
+    """
+    Compatibilidad retrocompatible con la API existente de render_image_zoom_video,
+    delegando al nuevo motor cinematográfico Ken Burns.
+    """
+    return render_image_ken_burns_video(
+        image_path=image_path,
+        clip_duration=clip_duration,
+        video_aspect=VideoAspect.portrait,
+        effect="zoom_in",
+    )
 
 
 def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
@@ -1977,8 +2109,8 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再渲染
                 # 用于导出的图片片段。
                 close_clip(clip)
-                video_file = render_image_zoom_video(
-                    material_source_path, clip_duration
+                video_file = render_image_ken_burns_video(
+                    material_source_path, clip_duration, effect="auto"
                 )
                 material.url = video_file
                 logger.success(f"image processed: {video_file}")

@@ -1,0 +1,11 @@
+services:
+  webui:
+    user: "1000:1000"
+    environment:
+      HOME: /tmp
+  api:
+    user: "1000:1000"
+    environment:
+      HOME: /tmp
+    ports: !override
+      - "127.0.0.1:18080:8080"

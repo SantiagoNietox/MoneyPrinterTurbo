@@ -1,5 +1,7 @@
 # Use an official Python runtime as a parent image
-FROM python:3.11-slim-bullseye
+# bookworm (Debian 12) en lugar de bullseye: bullseye pasó a LTS y su mirror
+# de seguridad en deb.debian.org deja de servir paquetes (404 en apt-get).
+FROM python:3.11-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
@@ -23,8 +25,10 @@ RUN set -u; \
     write_debian_sources() { \
         main_url="$1"; \
         security_url="$2"; \
-        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\ndeb %s bullseye-security main\n' \
-            "$main_url" "$main_url" "$security_url" > /etc/apt/sources.list; \
+        suite="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_CODENAME:-bookworm}")"; \
+        printf 'deb %s %s main\ndeb %s %s-updates main\ndeb %s %s-security main\n' \
+            "$main_url" "$suite" "$main_url" "$suite" "$security_url" "$suite" > /etc/apt/sources.list; \
+        rm -f /etc/apt/sources.list.d/debian.sources; \
         rm -rf /var/lib/apt/lists/*; \
     }; \
     install_system_dependencies() { \

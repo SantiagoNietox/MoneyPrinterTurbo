@@ -93,6 +93,7 @@ _VIDEO_MUSIC_PROVIDERS = {
 
 
 _SUPPORTED_VIDEO_SOURCES = frozenset({
+    "contextual",
     "pexels", "pixabay", "coverr", "local", "wavespeed",
     "volcengine_seedance", "ofox", "metaso_minimax", "muapi",
     "loomloom", "openai_image",
@@ -356,12 +357,20 @@ def generate_terms(task_id, params, video_script):
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        video_terms = llm.generate_terms(
-            video_subject=params.video_subject,
-            video_script=utils.remove_pause_tags(video_script),
-            amount=8 if params.match_materials_to_script else 5,
-            match_script_order=params.match_materials_to_script,
-        )
+        source = getattr(params, "video_source", None)
+        if not source:
+            source = config.app.get("video_source", "")
+        is_contextual = source == "contextual"
+        term_amount = 10 if is_contextual else (8 if params.match_materials_to_script else 5)
+        term_kwargs = {
+            "video_subject": params.video_subject,
+            "video_script": utils.remove_pause_tags(video_script),
+            "amount": term_amount,
+            "match_script_order": True if is_contextual else params.match_materials_to_script,
+        }
+        if is_contextual:
+            term_kwargs["video_source"] = "contextual"
+        video_terms = llm.generate_terms(**term_kwargs)
     else:
         if isinstance(video_terms, str):
             video_terms = [term.strip() for term in re.split(r"[,，]", video_terms)]
@@ -786,7 +795,7 @@ def get_video_materials(
                 video_aspect=params.video_aspect,
                 video_concat_mode=(
                     VideoConcatMode.sequential
-                    if params.match_materials_to_script
+                    if (params.match_materials_to_script or getattr(params, "video_source", "") == "contextual")
                     else params.video_concat_mode
                 ),
                 audio_duration=audio_duration * params.video_count,
@@ -954,7 +963,7 @@ def generate_final_videos(
     combined_video_paths = []
     warnings = []
     allocate_batch_materials = params.video_count > 1 and params.video_source in {
-        "pexels", "pixabay", "coverr", "local"
+        "contextual", "pexels", "pixabay", "coverr", "local"
     }
     source_usage = {}
     material_selections = []
@@ -970,7 +979,7 @@ def generate_final_videos(
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
     # Matching preserves keyword order; batch allocation varies each keyword's candidates.
-    if params.match_materials_to_script:
+    if params.match_materials_to_script or getattr(params, "video_source", "") == "contextual":
         video_concat_mode = VideoConcatMode.sequential
     elif params.video_count == 1:
         video_concat_mode = params.video_concat_mode
