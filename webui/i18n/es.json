@@ -187,6 +187,8 @@
     "Display Mode": "Visualización de subtítulos",
     "Sentence by Sentence": "Frase completa",
     "Single Word (Word by Word)": "Palabra por palabra",
+    "Karaoke (Word Highlight)": "Karaoke (Resaltado dinámico)",
+    "Word Highlight Color": "Color de resaltado activo",
     "Word-by-word Timing Help": "La sincronización palabra por palabra es más precisa con Azure TTS V1 (Edge TTS) o Whisper. Otros proveedores de voz pueden usar frases o grupos de palabras.",
     "Subtitle Animation": "Animación de entrada",
     "Pop Up (Spring)": "Aparición con rebote",

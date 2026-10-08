@@ -1455,6 +1455,140 @@ def _rounded_subtitle_background_clip(
     return ImageClip(np.array(img), transparent=True)
 
 
+_HI_TAG_RE = re.compile(r"<hi>(.*?)</hi>", re.IGNORECASE)
+
+
+def _render_karaoke_image_clip(
+    tagged_text: str,
+    font_path: str,
+    font_size: int,
+    text_color: str,
+    highlight_color: str,
+    stroke_color: str,
+    stroke_width: float,
+    canvas_width: int,
+    bg_color: str = None,
+    rounded_bg: bool = False,
+) -> ImageClip:
+    """
+    Renders a karaoke-style subtitle cue as an ImageClip with transparent background.
+    The active spoken word (enclosed in <hi>...</hi>) is highlighted with highlight_color,
+    while all other words in the phrase remain in text_color with black stroke outline.
+    Multi-line wrapping is applied naturally if the phrase exceeds 90% of canvas_width.
+    """
+    try:
+        font = ImageFont.truetype(font_path, int(font_size))
+    except Exception as e:
+        logger.warning(
+            f"failed to load font '{font_path}' for karaoke, falling back to default: {str(e)}"
+        )
+        font = ImageFont.load_default()
+
+    raw_tokens = tagged_text.strip().split()
+    words = []
+    hi_indices = set()
+    for i, tok in enumerate(raw_tokens):
+        match = _HI_TAG_RE.search(tok)
+        if match:
+            clean = _HI_TAG_RE.sub(r"\1", tok)
+            words.append(clean)
+            hi_indices.add(i)
+        else:
+            words.append(tok)
+
+    if not words:
+        words = [""]
+
+    try:
+        space_w = font.getbbox(" ")[2] - font.getbbox(" ")[0]
+    except Exception:
+        space_w = int(font_size * 0.25)
+
+    max_allowed_w = int(canvas_width * 0.90)
+
+    # Wrap into lines
+    lines = []
+    curr_line = []
+    curr_w = 0
+
+    for i, word in enumerate(words):
+        try:
+            bbox = font.getbbox(word)
+            w_w = bbox[2] - bbox[0]
+        except Exception:
+            w_w = len(word) * int(font_size * 0.5)
+
+        is_hi = i in hi_indices
+        space_needed = space_w if curr_line else 0
+        if curr_line and (curr_w + space_needed + w_w > max_allowed_w):
+            lines.append(curr_line)
+            curr_line = [(word, is_hi, w_w)]
+            curr_w = w_w
+        else:
+            curr_line.append((word, is_hi, w_w))
+            curr_w += space_needed + w_w
+
+    if curr_line:
+        lines.append(curr_line)
+
+    line_height = int(font_size * 1.35)
+    vertical_padding = int(font_size * 0.4)
+    clip_h = int(line_height * len(lines) + vertical_padding)
+
+    img = Image.new("RGBA", (canvas_width, clip_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Optional background if enabled
+    if bg_color:
+        max_line_w = max(
+            (sum(w for _, _, w in line) + space_w * (len(line) - 1))
+            for line in lines
+        )
+        pad_x = int(font_size * (0.4 if rounded_bg else 0.6))
+        box_w = min(canvas_width, max_line_w + 2 * pad_x)
+        box_x = (canvas_width - box_w) // 2
+        rgb = _hex_to_rgb(bg_color)
+        alpha = 140 if rounded_bg else 255
+        if rounded_bg:
+            radius = max(8, int(font_size * 0.4))
+            draw.rounded_rectangle(
+                [box_x, 0, box_x + box_w, clip_h],
+                radius=radius,
+                fill=(rgb[0], rgb[1], rgb[2], alpha),
+            )
+        else:
+            draw.rectangle(
+                [box_x, 0, box_x + box_w, clip_h],
+                fill=(rgb[0], rgb[1], rgb[2], alpha),
+            )
+
+    start_y = int(font_size * 0.2)
+    s_width = int(stroke_width) if stroke_width else 0
+
+    for l_idx, line in enumerate(lines):
+        line_w = sum(w for _, _, w in line) + space_w * (len(line) - 1)
+        curr_x = (canvas_width - line_w) // 2
+        curr_y = start_y + l_idx * line_height
+
+        for word, is_hi, w_w in line:
+            color = highlight_color if is_hi else text_color
+            if s_width > 0 and stroke_color:
+                draw.text(
+                    (curr_x, curr_y),
+                    word,
+                    font=font,
+                    fill=color,
+                    stroke_width=s_width,
+                    stroke_fill=stroke_color,
+                )
+            else:
+                draw.text((curr_x, curr_y), word, font=font, fill=color)
+            curr_x += w_w + space_w
+
+    arr = np.array(img)
+    return ImageClip(arr, transparent=True)
+
+
 def _get_visible_center_position(
     text_clip: TextClip,
     container_width: int,
@@ -1501,6 +1635,8 @@ def validate_subtitle_colors(params: VideoParams) -> None:
         colors.append(("stroke_color", params.stroke_color))
     if isinstance(params.text_background_color, str):
         colors.append(("text_background_color", params.text_background_color))
+    if getattr(params, "word_highlight_color", None):
+        colors.append(("word_highlight_color", params.word_highlight_color))
     for field, value in colors:
         if value is None:
             continue
@@ -1629,134 +1765,152 @@ def generate_video(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
         has_subtitle_background = bool(bg_color)
-        # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
-        # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
-        padding_ratio = 0.4 if rounded_bg_enabled else 0.6
-        pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
-        # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
-        # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
-        # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
-        # 都走这条逻辑；无背景字幕则保持原有最大宽度。
-        text_max_width = max(1, int(max_width) - 2 * pad_x)
-        wrapped_txt, txt_height = wrap_text(
-            phrase,
-            max_width=text_max_width,
-            font=font_path,
-            fontsize=params.font_size,
-        )
-        interline = int(params.font_size * 0.25)
-        line_count = wrapped_txt.count("\n") + 1
-        vertical_padding = int(params.font_size * 0.35)
-        # Pillow/MoviePy 会把描边向字形上下两侧扩张，并把这部分计入每一行
-        # 的行进高度。若只在整个字幕块外增加一次描边留白，粗描边多行文本
-        # 仍会逐行累积误差。这里按实际行数计入双侧描边空间，默认细描边只
-        # 增加少量高度，而“小字号 + 粗描边 + 多行”也能完整显示。
-        stroke_padding = int(params.stroke_width * 2 * line_count)
-        text_clip_margin_y = max(
-            int(params.font_size * 0.3), int(params.stroke_width * 2)
-        )
-        # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
-        # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
-        # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
-        # 背景框与文字本身都能完整渲染出来。
-        clip_h = int(
-            txt_height
-            + vertical_padding
-            + (interline * line_count)
-            + stroke_padding
-        )
 
-        if rounded_bg_enabled:
-            # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
-            # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
-            try:
-                font = ImageFont.truetype(font_path, params.font_size)
-                text_w = max(
-                    int(font.getbbox(line)[2] - font.getbbox(line)[0])
-                    for line in wrapped_txt.split("\n")
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"failed to measure subtitle text width, fallback to max width: {str(exc)}"
-                )
-                text_w = int(max_width)
-
-            box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
-            radius = max(8, int(params.font_size * 0.4))
-            text_clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
+        if "<hi>" in phrase and "</hi>" in phrase:
+            highlight_color = (
+                getattr(params, "word_highlight_color", "#FFE600") or "#FFE600"
+            )
+            _clip = _render_karaoke_image_clip(
+                tagged_text=phrase,
+                font_path=font_path,
                 font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=(box_w, None),
-                text_align="center",
-                margin=(0, text_clip_margin_y),
-            )
-            clip_h = max(clip_h, text_clip.h)
-            bg_clip = _rounded_subtitle_background_clip(
-                width=box_w,
-                height=clip_h,
-                color=bg_color,
-                alpha=140,
-                radius=radius,
-            )
-            text_position = _get_visible_center_position(text_clip, box_w, clip_h)
-            _clip = CompositeVideoClip(
-                [bg_clip, text_clip.with_position(text_position)],
-                size=(box_w, clip_h),
-            )
-        elif bg_color:
-            size = (
-                int(max_width),
-                clip_h,
-            )
-            text_clip = TextClip(
-                text=wrapped_txt,
-                font=font_path,
-                font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=(int(max_width), None),
-                text_align="center",
-                margin=(0, text_clip_margin_y),
-            )
-            size = (size[0], max(size[1], text_clip.h))
-            bg_clip = _rounded_subtitle_background_clip(
-                width=size[0],
-                height=size[1],
-                color=bg_color,
-                alpha=255,
-                radius=0,
-            )
-            text_position = _get_visible_center_position(text_clip, size[0], size[1])
-            _clip = CompositeVideoClip(
-                [bg_clip, text_clip.with_position(text_position)],
-                size=size,
+                text_color=params.text_fore_color or "#FFFFFF",
+                highlight_color=highlight_color,
+                stroke_color=params.stroke_color or "#000000",
+                stroke_width=params.stroke_width or 2.0,
+                canvas_width=video_width,
+                bg_color=bg_color,
+                rounded_bg=rounded_bg_enabled,
             )
         else:
-            size = (
-                int(max_width),
-                clip_h,
-            )
-            _clip = TextClip(
-                text=wrapped_txt,
+            # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
+            # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。
+            padding_ratio = 0.4 if rounded_bg_enabled else 0.6
+            pad_x = int(params.font_size * padding_ratio) if has_subtitle_background else 0
+            # 字幕背景需要给文字左右留出明确内边距。先从可用宽度中扣除
+            # padding 再换行，避免长英文或大字号刚好撑满 90% 视频宽度后，
+            # 文字贴到背景框边缘，看起来像被裁切。普通矩形背景和圆角背景
+            # 都走这条逻辑；无背景字幕则保持原有最大宽度。
+            text_max_width = max(1, int(max_width) - 2 * pad_x)
+            wrapped_txt, txt_height = wrap_text(
+                phrase,
+                max_width=text_max_width,
                 font=font_path,
-                font_size=params.font_size,
-                color=params.text_fore_color,
-                bg_color=None,
-                stroke_color=params.stroke_color,
-                stroke_width=params.stroke_width,
-                interline=interline,
-                size=size,
-                text_align="center",
+                fontsize=params.font_size,
             )
+            interline = int(params.font_size * 0.25)
+            line_count = wrapped_txt.count("\n") + 1
+            vertical_padding = int(params.font_size * 0.35)
+            # Pillow/MoviePy 会把描边向字形上下两侧扩张，并把这部分计入每一行
+            # 的行进高度。若只在整个字幕块外增加一次描边留白，粗描边多行文本
+            # 仍会逐行累积误差。这里按实际行数计入双侧描边空间，默认细描边只
+            # 增加少量高度，而“小字号 + 粗描边 + 多行”也能完整显示。
+            stroke_padding = int(params.stroke_width * 2 * line_count)
+            text_clip_margin_y = max(
+                int(params.font_size * 0.3), int(params.stroke_width * 2)
+            )
+            # MoviePy 在 `method=label` 下会自动收缩文本框高度，遇到多行字幕、
+            # 描边或背景色时，容易把最后一行的下半部分裁掉。这里显式传入
+            # 一个更保守的高度，把行间距和额外上下留白一并算进去，保证字幕
+            # 背景框与文字本身都能完整渲染出来。
+            clip_h = int(
+                txt_height
+                + vertical_padding
+                + (interline * line_count)
+                + stroke_padding
+            )
+
+            if rounded_bg_enabled:
+                # 圆角背景需要贴合文字宽度，而不是沿用 90% 视频宽度。这里先用
+                # PIL 测量最长一行文字，再加水平内边距，避免短字幕出现过宽底板。
+                try:
+                    font = ImageFont.truetype(font_path, params.font_size)
+                    text_w = max(
+                        int(font.getbbox(line)[2] - font.getbbox(line)[0])
+                        for line in wrapped_txt.split("\n")
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"failed to measure subtitle text width, fallback to max width: {str(exc)}"
+                    )
+                    text_w = int(max_width)
+
+                box_w = max(1, min(int(max_width), text_w + 2 * pad_x))
+                radius = max(8, int(params.font_size * 0.4))
+                text_clip = TextClip(
+                    text=wrapped_txt,
+                    font=font_path,
+                    font_size=params.font_size,
+                    color=params.text_fore_color,
+                    bg_color=None,
+                    stroke_color=params.stroke_color,
+                    stroke_width=params.stroke_width,
+                    interline=interline,
+                    size=(box_w, None),
+                    text_align="center",
+                    margin=(0, text_clip_margin_y),
+                )
+                clip_h = max(clip_h, text_clip.h)
+                bg_clip = _rounded_subtitle_background_clip(
+                    width=box_w,
+                    height=clip_h,
+                    color=bg_color,
+                    alpha=140,
+                    radius=radius,
+                )
+                text_position = _get_visible_center_position(text_clip, box_w, clip_h)
+                _clip = CompositeVideoClip(
+                    [bg_clip, text_clip.with_position(text_position)],
+                    size=(box_w, clip_h),
+                )
+            elif bg_color:
+                size = (
+                    int(max_width),
+                    clip_h,
+                )
+                text_clip = TextClip(
+                    text=wrapped_txt,
+                    font=font_path,
+                    font_size=params.font_size,
+                    color=params.text_fore_color,
+                    bg_color=None,
+                    stroke_color=params.stroke_color,
+                    stroke_width=params.stroke_width,
+                    interline=interline,
+                    size=(int(max_width), None),
+                    text_align="center",
+                    margin=(0, text_clip_margin_y),
+                )
+                size = (size[0], max(size[1], text_clip.h))
+                bg_clip = _rounded_subtitle_background_clip(
+                    width=size[0],
+                    height=size[1],
+                    color=bg_color,
+                    alpha=255,
+                    radius=0,
+                )
+                text_position = _get_visible_center_position(text_clip, size[0], size[1])
+                _clip = CompositeVideoClip(
+                    [bg_clip, text_clip.with_position(text_position)],
+                    size=size,
+                )
+            else:
+                size = (
+                    int(max_width),
+                    clip_h,
+                )
+                _clip = TextClip(
+                    text=wrapped_txt,
+                    font=font_path,
+                    font_size=params.font_size,
+                    color=params.text_fore_color,
+                    bg_color=None,
+                    stroke_color=params.stroke_color,
+                    stroke_width=params.stroke_width,
+                    interline=interline,
+                    size=size,
+                    text_align="center",
+                )
         duration = subtitle_item[0][1] - subtitle_item[0][0]
         _clip = _clip.with_start(subtitle_item[0][0])
         _clip = _clip.with_end(subtitle_item[0][1])

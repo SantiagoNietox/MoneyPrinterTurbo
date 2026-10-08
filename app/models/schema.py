@@ -53,9 +53,9 @@ class VideoFitMode(str, Enum):
     contain = "contain"
 
 
-SubtitleDisplayMode = Literal["sentence", "word_by_word"]
+SubtitleDisplayMode = Literal["sentence", "word_by_word", "karaoke"]
 SubtitleAnimation = Literal["none", "pop_spring"]
-_SUBTITLE_DISPLAY_MODES = ("sentence", "word_by_word")
+_SUBTITLE_DISPLAY_MODES = ("sentence", "word_by_word", "karaoke")
 _SUBTITLE_ANIMATIONS = ("none", "pop_spring")
 
 
@@ -153,6 +153,7 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    word_highlight_color: Optional[str] = config.ui.get("word_highlight_color", "#FFE600")
 
     font_size: int = Field(default=60, ge=1)
     stroke_color: Optional[str] = "#000000"
@@ -183,6 +184,7 @@ class SubtitleRequest(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    word_highlight_color: Optional[str] = config.ui.get("word_highlight_color", "#FFE600")
     font_size: int = Field(default=60, ge=1)
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = Field(default=1.5, ge=0, allow_inf_nan=False)

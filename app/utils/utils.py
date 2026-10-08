@@ -255,16 +255,7 @@ def time_convert_seconds_to_hmsm(seconds) -> str:
 def text_to_srt(idx: int, msg: str, start_time: float, end_time: float) -> str:
     start_time = time_convert_seconds_to_hmsm(start_time)
     end_time = time_convert_seconds_to_hmsm(end_time)
-    srt = """%d
-%s --> %s
-%s
-        """ % (
-        idx,
-        start_time,
-        end_time,
-        msg,
-    )
-    return srt
+    return f"{idx}\n{start_time} --> {end_time}\n{msg.strip()}\n\n"
 
 
 def str_contains_punctuation(word):

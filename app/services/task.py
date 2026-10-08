@@ -648,7 +648,10 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.info("subtitle provider is empty, skip subtitle generation")
         return ""
 
-    if sub_maker is None and subtitle_provider != "whisper":
+    is_karaoke = getattr(params, "subtitle_display_mode", "sentence") == "karaoke"
+    is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
+
+    if not is_karaoke and sub_maker is None and subtitle_provider != "whisper":
         # 自定义音频不会经过 TTS，因此没有 Edge/Azure 等 TTS 返回的
         # sub_maker 时间轴。只有 Whisper 可以直接从音频文件转写字幕；
         # 其他字幕提供方继续保持原有行为，避免生成错误的空时间轴。
@@ -658,11 +661,16 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         )
         return ""
 
-    is_word_level = getattr(params, "subtitle_display_mode", "sentence") == "word_by_word"
-
     # A failed retry must never reuse captions from an earlier narration.
     with staged_subtitle_file(final_subtitle_path) as subtitle_path:
-        if subtitle_provider == "edge":
+        if is_karaoke:
+            logger.info("generating dynamic karaoke subtitles with word-level timestamps")
+            subtitle.create_karaoke_subtitles(
+                audio_file=audio_file,
+                subtitle_file=subtitle_path,
+                video_script=video_script,
+            )
+        elif subtitle_provider == "edge":
             voice.create_subtitle(
                 text=video_script,
                 sub_maker=sub_maker,
@@ -708,6 +716,7 @@ def get_video_materials(
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    video_script: str = "",
 ):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
@@ -721,6 +730,20 @@ def get_video_materials(
                 "no valid local video materials were found",
             )
             return None
+
+        # Si hay guion y varios clips locales, ordenarlos semánticamente
+        if video_script and len(materials) > 1:
+            try:
+                from app.services import semantic_matcher
+                materials = semantic_matcher.match_and_order_materials_semantically(
+                    script=video_script,
+                    candidate_materials=materials,
+                    total_duration=audio_duration,
+                    clip_duration=params.video_clip_duration,
+                )
+            except Exception as sem_err:
+                logger.warning(f"Semantic matching for local materials failed: {sem_err}")
+
         return [material_info.url for material_info in materials]
     elif params.video_source == "loomloom":
         if not isinstance(
@@ -804,6 +827,8 @@ def get_video_materials(
                 # 素材阶段占用 40%~50%：每下完一个文件推进一次，慢速网络下
                 # 进度条不再长时间停在 40%。
                 progress_callback=_stage_progress_reporter(task_id, 40, 50),
+                video_script=video_script,
+                video_subject=params.video_subject,
             )
         except volcengine_seedance.VolcEngineSeedanceError as exc:
             # 未确认状态和已生成但下载失败都对应一个可在方舟控制台恢复的远端
@@ -1750,6 +1775,7 @@ def _run_pipeline(
         video_terms,
         audio_duration,
         loomloom_video_request=loomloom_video_request,
+        video_script=video_script,
     )
     if not downloaded_videos:
         return _mark_task_failed(

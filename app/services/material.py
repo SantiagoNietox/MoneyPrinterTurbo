@@ -1833,10 +1833,13 @@ def _download_videos_contextual_on_demand(
     max_clip_duration: int,
     material_directory: str,
     progress_callback: Callable[[float], None] | None = None,
+    video_script: str = "",
+    video_subject: str = "",
 ) -> List[str]:
     """
-    Descarga imágenes reales de archivo y prensa basadas en términos contextuales
-    y las transforma en clips de video usando el motor cinematográfico Ken Burns.
+    Descarga imágenes reales de archivo y metraje de video contextual,
+    los empareja semánticamente con el guion usando embeddings y los transforma
+    en clips usando el motor cinematográfico Ken Burns y cortes de escena.
     Cubre la duración total requerida por el audio narrado.
     """
     if not material_directory:
@@ -1859,19 +1862,20 @@ def _download_videos_contextual_on_demand(
         return video_paths
 
     provider = contextual_provider.ContextualMediaProvider()
-    
-    video_subject = ""
-    video_script = ""
-    task_script_file = os.path.join(utils.task_dir(task_id), "script.json")
-    if os.path.isfile(task_script_file):
-        try:
-            with open(task_script_file, "r", encoding="utf-8") as f:
-                s_data = json.load(f)
-                video_script = s_data.get("script", "")
-                params_obj = s_data.get("params", {})
-                video_subject = params_obj.get("video_subject", "")
-        except Exception:
-            pass
+
+    if not video_script or not video_subject:
+        task_script_file = os.path.join(utils.task_dir(task_id), "script.json")
+        if os.path.isfile(task_script_file):
+            try:
+                with open(task_script_file, "r", encoding="utf-8") as f:
+                    s_data = json.load(f)
+                    if not video_script:
+                        video_script = s_data.get("script", "")
+                    if not video_subject:
+                        params_obj = s_data.get("params", {})
+                        video_subject = params_obj.get("video_subject", "")
+            except Exception:
+                pass
 
     needed_clips = max(1, int(math.ceil(required_duration / max(1, max_clip_duration))))
     # Asegurar al menos 2 imágenes por término para tener variedad en el pool
@@ -1973,79 +1977,165 @@ def _download_videos_contextual_on_demand(
                 f"[Contextual] Could not fetch trailer clips, falling back to 100% archival photos: {trailer_err}"
             )
 
-    # 5. Intercalar metraje real de vídeo con fotografías de archivo (Ken Burns)
-    # Patrón: 1 Vídeo Real -> 1 Foto Archivo -> 1 Vídeo Real -> 1 Foto Archivo...
-    # (Garantiza mínimo 50% de metraje de vídeo real en movimiento en todo el Reel)
-    trailer_index = 0
-    photo_index = 0
+    # 5. Organizar metraje real de vídeo con fotografías de archivo (Ken Burns)
+    # Si hay guion narrativo disponible, usamos Búsqueda Semántica con Embeddings
+    # para emparejar cada fragmento con la escena del guion correspondiente.
+    all_photo_candidates = []
+    seen_photo_urls = set()
+    for pool in term_pools:
+        for p in pool:
+            if p.url and p.url not in seen_photo_urls:
+                seen_photo_urls.add(p.url)
+                all_photo_candidates.append(p)
 
-    while total_duration < required_duration and (
-        photo_index < len(interleaved_items) or trailer_index < len(trailer_clips)
-    ):
-        # Turnos alternados: Par = VÍDEO REAL, Impar = FOTO KEN BURNS
-        want_video = (len(video_paths) % 2 == 0)
-
-        if want_video and trailer_index < len(trailer_clips):
-            t_item = trailer_clips[trailer_index]
-            trailer_index += 1
-            video_paths.append(t_item.url)
-            material_sources.append(_material_source_record(t_item, t_item.url))
-            total_duration += max_clip_duration
-            logger.info(
-                f"[Contextual] Appended real video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+    semantic_plan = None
+    if video_script and (trailer_clips or all_photo_candidates):
+        try:
+            from app.services import semantic_matcher
+            semantic_plan = semantic_matcher.match_and_order_contextual_materials(
+                script=video_script,
+                video_candidates=trailer_clips,
+                photo_candidates=all_photo_candidates,
+                total_duration=required_duration,
+                clip_duration=max_clip_duration,
             )
+            if semantic_plan:
+                logger.info(
+                    f"[Contextual] Executing semantic material plan with {len(semantic_plan)} clips"
+                )
+        except Exception as sem_err:
+            logger.warning(
+                f"[Contextual] Semantic matching error, falling back to round-robin: {sem_err}"
+            )
+            semantic_plan = None
+
+    rendered_photos_cache: Dict[str, str] = {}
+
+    if semantic_plan:
+        for item_type, item in semantic_plan:
+            if total_duration >= required_duration:
+                break
+
+            if item_type == "video":
+                video_paths.append(item.url)
+                material_sources.append(_material_source_record(item, item.url))
+                total_duration += max_clip_duration
+                logger.info(
+                    f"[Contextual] Appended semantic video scene: {os.path.basename(item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+                )
+            else:
+                try:
+                    if item.url in rendered_photos_cache:
+                        video_file = rendered_photos_cache[item.url]
+                    else:
+                        chosen_effect = effects_sequence[clip_counter % len(effects_sequence)]
+                        clip_counter += 1
+                        video_file = video.render_image_ken_burns_video(
+                            image_path=item.url,
+                            clip_duration=max_clip_duration,
+                            video_aspect=video_aspect,
+                            effect=chosen_effect,
+                        )
+                        if video_file:
+                            rendered_photos_cache[item.url] = video_file
+
+                    if not video_file:
+                        continue
+                    video_paths.append(video_file)
+                    material_sources.append(_material_source_record(item, video_file))
+                    total_duration += max_clip_duration
+                    logger.info(
+                        f"[Contextual] Appended semantic photo scene: {os.path.basename(video_file)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+                    )
+                except Exception as render_err:
+                    logger.warning(
+                        f"[Contextual] Ken Burns render failed for {item.url}: {render_err}"
+                    )
+                    continue
+
             if progress_callback and required_duration > 0:
                 try:
                     progress_callback(min(1.0, total_duration / required_duration))
                 except Exception:
                     pass
-            continue
 
-        if photo_index < len(interleaved_items):
-            item = interleaved_items[photo_index]
-            photo_index += 1
-            try:
-                chosen_effect = effects_sequence[clip_counter % len(effects_sequence)]
-                clip_counter += 1
-                video_file = video.render_image_ken_burns_video(
-                    image_path=item.url,
-                    clip_duration=max_clip_duration,
-                    video_aspect=video_aspect,
-                    effect=chosen_effect,
-                )
-                if not video_file:
-                    continue
-                video_paths.append(video_file)
-                material_sources.append(_material_source_record(item, video_file))
+    # Si la búsqueda semántica no se ejecutó o no alcanzó a cubrir la duración requerida:
+    if total_duration < required_duration:
+        trailer_index = 0
+        photo_index = 0
+
+        while total_duration < required_duration and (
+            photo_index < len(interleaved_items) or trailer_index < len(trailer_clips)
+        ):
+            want_video = (len(video_paths) % 2 == 0)
+
+            if want_video and trailer_index < len(trailer_clips):
+                t_item = trailer_clips[trailer_index]
+                trailer_index += 1
+                video_paths.append(t_item.url)
+                material_sources.append(_material_source_record(t_item, t_item.url))
                 total_duration += max_clip_duration
-
+                logger.info(
+                    f"[Contextual] Appended real video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+                )
                 if progress_callback and required_duration > 0:
                     try:
                         progress_callback(min(1.0, total_duration / required_duration))
                     except Exception:
                         pass
                 continue
-            except Exception as render_err:
-                logger.warning(
-                    f"[Contextual] Ken Burns render failed for {item.url}: {render_err}"
-                )
-                continue
 
-        if trailer_index < len(trailer_clips):
-            t_item = trailer_clips[trailer_index]
-            trailer_index += 1
-            video_paths.append(t_item.url)
-            material_sources.append(_material_source_record(t_item, t_item.url))
-            total_duration += max_clip_duration
-            logger.info(
-                f"[Contextual] Appended extra video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
-            )
-            if progress_callback and required_duration > 0:
+            if photo_index < len(interleaved_items):
+                item = interleaved_items[photo_index]
+                photo_index += 1
                 try:
-                    progress_callback(min(1.0, total_duration / required_duration))
-                except Exception:
-                    pass
-            continue
+                    if item.url in rendered_photos_cache:
+                        video_file = rendered_photos_cache[item.url]
+                    else:
+                        chosen_effect = effects_sequence[clip_counter % len(effects_sequence)]
+                        clip_counter += 1
+                        video_file = video.render_image_ken_burns_video(
+                            image_path=item.url,
+                            clip_duration=max_clip_duration,
+                            video_aspect=video_aspect,
+                            effect=chosen_effect,
+                        )
+                        if video_file:
+                            rendered_photos_cache[item.url] = video_file
+
+                    if not video_file:
+                        continue
+                    video_paths.append(video_file)
+                    material_sources.append(_material_source_record(item, video_file))
+                    total_duration += max_clip_duration
+
+                    if progress_callback and required_duration > 0:
+                        try:
+                            progress_callback(min(1.0, total_duration / required_duration))
+                        except Exception:
+                            pass
+                    continue
+                except Exception as render_err:
+                    logger.warning(
+                        f"[Contextual] Ken Burns render failed for {item.url}: {render_err}"
+                    )
+                    continue
+
+            if trailer_index < len(trailer_clips):
+                t_item = trailer_clips[trailer_index]
+                trailer_index += 1
+                video_paths.append(t_item.url)
+                material_sources.append(_material_source_record(t_item, t_item.url))
+                total_duration += max_clip_duration
+                logger.info(
+                    f"[Contextual] Appended extra video scene: {os.path.basename(t_item.url)} ({total_duration:.1f}s / {required_duration:.1f}s)"
+                )
+                if progress_callback and required_duration > 0:
+                    try:
+                        progress_callback(min(1.0, total_duration / required_duration))
+                    except Exception:
+                        pass
+                continue
 
     # Último recurso solo si no hubo suficientes imágenes en absoluto
     if total_duration < required_duration and interleaved_items:
@@ -2396,6 +2486,8 @@ def download_videos(
     max_clip_duration: int = 5,
     match_script_order: bool = False,
     progress_callback: Callable[[float], None] | None = None,
+    video_script: str = "",
+    video_subject: str = "",
 ) -> List[str]:
     """
     搜索并下载覆盖配音时长所需的素材，返回本地文件路径。
@@ -2512,6 +2604,8 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             progress_callback=progress_callback,
+            video_script=video_script,
+            video_subject=video_subject,
         )
 
     if match_script_order:
@@ -2524,6 +2618,7 @@ def download_videos(
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
             progress_callback=progress_callback,
+            video_script=video_script,
         )
 
     valid_video_items = []
@@ -3180,17 +3275,23 @@ def _download_videos_by_script_order(
     max_clip_duration: int,
     material_directory: str,
     progress_callback: Callable[[float], None] | None = None,
+    video_script: str = "",
 ) -> List[str]:
     """
-    按脚本文案顺序下载素材。
-
-    默认下载逻辑会把所有关键词的候选素材合并成一个大列表；如果第一个
-    关键词返回很多结果，最终下载时可能一直消耗这个关键词的素材，后续
-    脚本主题就排不上时间线。这里按关键词分组后轮询下载：
-    第 1 轮取每个关键词的第 1 个候选，第 2 轮取每个关键词的第 2 个候选。
-    这样在不重写视频合成引擎的前提下，尽量保证素材顺序贴近文案顺序。
+    按脚本文案语义及顺序下载素材。
+    若存在脚本文案，优先使用 fastembed 语义向量匹配将最相关的镜头分配到各个时间段；
+    若未提供文案或模型不可用，则按关键词分组轮询下载。
     """
     logger.info("downloading videos with script-order material matching")
+    if not video_script:
+        task_script_file = os.path.join(utils.task_dir(task_id), "script.json")
+        if os.path.isfile(task_script_file):
+            try:
+                with open(task_script_file, "r", encoding="utf-8") as f:
+                    video_script = json.load(f).get("script", "")
+            except Exception:
+                pass
+
     candidate_groups = []
     valid_video_urls = set()
     found_duration = 0.0
@@ -3223,8 +3324,64 @@ def _download_videos_by_script_order(
     on_downloaded = _covered_duration_reporter(
         progress_callback, audio_duration, max_clip_duration
     )
-    # 每个关键词独立推进候选下标：只有本轮真正被选中下载的候选才推进，
-    # 未被选中的候选保留到下一轮，避免被整轮统一的下标跳过。
+
+    # 1. Intentar emparejamiento semántico directo con el guion si existe
+    semantic_ordered = None
+    if video_script and candidate_groups:
+        all_candidates = [item for _, items in candidate_groups for item in items]
+        try:
+            from app.services import semantic_matcher
+            semantic_ordered = semantic_matcher.match_and_order_materials_semantically(
+                script=video_script,
+                candidate_materials=all_candidates,
+                total_duration=audio_duration,
+                clip_duration=max_clip_duration,
+            )
+            if semantic_ordered:
+                logger.info(
+                    f"downloading {len(semantic_ordered)} videos matching script semantics"
+                )
+        except Exception as sem_err:
+            logger.warning(f"semantic video matching fallback: {sem_err}")
+            semantic_ordered = None
+
+    if semantic_ordered:
+        pending_items = list(semantic_ordered)
+        while pending_items and total_duration <= audio_duration:
+            batch = []
+            proj_dur = total_duration
+            for item in pending_items:
+                batch.append(item)
+                proj_dur += min(max_clip_duration, item.duration)
+                if proj_dur > audio_duration:
+                    break
+            pending_items = pending_items[len(batch):]
+
+            downloaded_materials = _download_materials_in_parallel(
+                materials=[
+                    (
+                        item.source_info.get("search_term", "")
+                        if isinstance(item.source_info, dict)
+                        else "",
+                        item,
+                    )
+                    for item in batch
+                ],
+                material_directory=material_directory,
+                on_downloaded=on_downloaded,
+            )
+            for search_term, item, saved_video_path in downloaded_materials:
+                if saved_video_path:
+                    video_paths.append(saved_video_path)
+                    try:
+                        material_sources.append(
+                            _material_source_record(item, saved_video_path)
+                        )
+                    except Exception:
+                        pass
+                    total_duration += min(max_clip_duration, item.duration)
+
+    # 2. Respaldo por rotación de grupos si aún falta duración
     next_candidate_indices = [0] * len(candidate_groups)
     while candidate_groups and total_duration <= audio_duration:
         round_materials = [

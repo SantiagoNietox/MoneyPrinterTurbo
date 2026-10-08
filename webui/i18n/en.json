@@ -193,6 +193,8 @@
     "Display Mode": "Subtitle display",
     "Sentence by Sentence": "Whole sentence",
     "Single Word (Word by Word)": "Word by word",
+    "Karaoke (Word Highlight)": "Karaoke (Word Highlight)",
+    "Word Highlight Color": "Word Highlight Color",
     "Word-by-word Timing Help": "Word-by-word timing is most accurate with Azure TTS V1 (Edge TTS) or Whisper. Other voice providers may fall back to phrase or sentence timing.",
     "Subtitle Animation": "Entrance animation",
     "None (Animation)": "None",

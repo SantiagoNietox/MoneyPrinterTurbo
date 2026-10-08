@@ -194,8 +194,9 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_enabled": True,
     "font_name": "BeVietnamPro-Bold.ttf",
     "subtitle_position": "two_thirds_bottom",
-    "subtitle_display_mode": "word_by_word",
-    "subtitle_animation": "pop_spring",
+    "subtitle_display_mode": "karaoke",
+    "word_highlight_color": "#FFE600",
+    "subtitle_animation": "none",
     "custom_position": 70.0,
     "text_fore_color": "#FFFFFF",
     "font_size": 52,
@@ -1633,6 +1634,9 @@ def _apply_restored_params(params):
         100, max(30, int(params.get("font_size", 60)))
     )
     st.session_state["stroke_color_picker"] = params.get("stroke_color") or "#000000"
+    st.session_state["word_highlight_color_picker"] = (
+        params.get("word_highlight_color") or "#FFE600"
+    )
     st.session_state["stroke_width_slider"] = min(
         10.0, max(0.0, float(params.get("stroke_width", 1.5)))
     )
@@ -2584,6 +2588,9 @@ def reset_subtitle_settings():
     st.session_state["rounded_subtitle_background_checkbox"] = defaults[
         "rounded_subtitle_background"
     ]
+    st.session_state["word_highlight_color_picker"] = defaults.get(
+        "word_highlight_color", "#FFE600"
+    )
 
     # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
     for key in (
@@ -2591,6 +2598,7 @@ def reset_subtitle_settings():
         "font_name",
         "subtitle_position",
         "subtitle_display_mode",
+        "word_highlight_color",
         "subtitle_animation",
         "custom_position",
         "text_fore_color",
@@ -7656,10 +7664,11 @@ def _render_subtitle_settings(panel, params):
             params.subtitle_position = selected_subtitle_position
             _set_runtime_config("ui", "subtitle_position", params.subtitle_position)
 
-            # Subtitle Display Mode (Sentence vs Single Word)
+            # Subtitle Display Mode (Sentence vs Single Word vs Karaoke)
             subtitle_display_modes = [
                 (tr("Sentence by Sentence"), "sentence"),
                 (tr("Single Word (Word by Word)"), "word_by_word"),
+                (tr("Karaoke (Word Highlight)"), "karaoke"),
             ]
             saved_display_mode = config.ui.get(
                 "subtitle_display_mode",
@@ -7685,6 +7694,32 @@ def _render_subtitle_settings(panel, params):
             _set_runtime_config(
                 "ui", "subtitle_display_mode", params.subtitle_display_mode
             )
+
+            # Active word highlight color (visible when karaoke mode is selected)
+            if selected_display_mode == "karaoke":
+                highlight_cols = st.columns([0.42, 0.58])
+                with highlight_cols[0]:
+                    saved_highlight_color = config.ui.get(
+                        "word_highlight_color",
+                        DEFAULT_SUBTITLE_SETTINGS.get(
+                            "word_highlight_color", "#FFE600"
+                        ),
+                    )
+                    st.session_state.setdefault(
+                        "word_highlight_color_picker", saved_highlight_color
+                    )
+                    params.word_highlight_color = st.color_picker(
+                        tr("Word Highlight Color"),
+                        key="word_highlight_color_picker",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui", "word_highlight_color", params.word_highlight_color
+                    )
+            else:
+                params.word_highlight_color = config.ui.get(
+                    "word_highlight_color", "#FFE600"
+                )
 
             # Subtitle Animation (None vs Pop Spring)
             subtitle_animations = [

@@ -3,6 +3,7 @@ import os.path
 import re
 import tempfile
 import threading
+from typing import Optional
 from timeit import default_timer as timer
 
 try:
@@ -360,6 +361,110 @@ def correct(subtitle_file, video_script):
         logger.info("Subtitle corrected")
     else:
         logger.success("Subtitle is correct")
+
+
+def create_karaoke_subtitles(
+    audio_file: str,
+    subtitle_file: str = "",
+    video_script: str = "",
+    max_words_per_phrase: int = 5,
+    max_chars_per_line: int = 28,
+) -> Optional[str]:
+    """
+    Genera subtítulos dinámicos de estilo Karaoke con sincronización palabra por palabra.
+    Agrupa el discurso en frases cortas de alto impacto (3-5 palabras) para formato vertical (9:16),
+    etiquetando cada palabra activa con <hi>palabra</hi> en su milisegundo exacto de pronunciación,
+    mientras la frase completa permanece visible en pantalla.
+    """
+    global model
+    if WhisperModel is None:
+        logger.warning("faster_whisper not available, skipping karaoke subtitle generation")
+        return ""
+    if not _ensure_model_loaded():
+        return None
+
+    if not subtitle_file:
+        subtitle_file = f"{audio_file}.srt"
+
+    logger.info(f"generating karaoke subtitles for {audio_file} -> {subtitle_file}")
+
+    try:
+        segments, info = model.transcribe(
+            audio_file,
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400),
+            **({"initial_prompt": initial_prompt} if initial_prompt else {}),
+        )
+    except Exception as exc:
+        logger.error(f"failed to transcribe audio for karaoke subtitles: {exc}")
+        return None
+
+    raw_words = []
+    for segment in segments:
+        for word in (segment.words or []):
+            cleaned = word.word.strip()
+            if cleaned:
+                raw_words.append({
+                    "word": cleaned,
+                    "start": round(float(word.start), 3),
+                    "end": round(float(word.end), 3),
+                })
+
+    if not raw_words:
+        logger.warning("whisper found no word timestamps; falling back to sentence subtitle")
+        return create(audio_file, subtitle_file=subtitle_file, word_level=False)
+
+    # Agrupar palabras en frases naturales (máximo 5 palabras, puntuación o pausa > 0.35s)
+    phrases = []
+    curr_phrase = []
+
+    for i, w in enumerate(raw_words):
+        curr_phrase.append(w)
+        is_punc = any(w["word"].endswith(p) for p in (".", ",", "!", "?", ";", ":", "…"))
+        has_pause = False
+        if i < len(raw_words) - 1:
+            if raw_words[i + 1]["start"] - w["end"] > 0.35:
+                has_pause = True
+
+        if len(curr_phrase) >= max_words_per_phrase or is_punc or has_pause:
+            phrases.append(curr_phrase)
+            curr_phrase = []
+
+    if curr_phrase:
+        phrases.append(curr_phrase)
+
+    srt_cues = []
+    idx = 1
+    for phrase in phrases:
+        plain_words = [w["word"] for w in phrase]
+        for w_i, active_w in enumerate(phrase):
+            cue_text_parts = []
+            for j, pw in enumerate(plain_words):
+                if j == w_i:
+                    cue_text_parts.append(f"<hi>{pw}</hi>")
+                else:
+                    cue_text_parts.append(pw)
+            cue_text = " ".join(cue_text_parts)
+
+            w_start = active_w["start"]
+            if w_i < len(phrase) - 1:
+                w_end = phrase[w_i + 1]["start"]
+            else:
+                w_end = active_w["end"]
+
+            # Garantizar duración positiva mínima
+            if w_end <= w_start:
+                w_end = w_start + 0.15
+
+            srt_cues.append(utils.text_to_srt(idx, cue_text, w_start, w_end))
+            idx += 1
+
+    content = "".join(srt_cues)
+    write_subtitle_file(subtitle_file, content)
+    logger.success(f"karaoke subtitle created: {subtitle_file} ({len(srt_cues)} cues)")
+    return subtitle_file
 
 
 if __name__ == "__main__":
